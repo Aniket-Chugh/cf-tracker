@@ -1043,7 +1043,7 @@ export default function App() {
             <span>Smart Recommendations</span>
           </div>
           <div className="text-sm">
-            © 2024 Codeforces Analytics
+          This tool is not affiliated with Codeforces. Data provided by Codeforces API.
           </div>
         </div>
       </motion.footer>
