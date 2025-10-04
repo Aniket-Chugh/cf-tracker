@@ -1,44 +1,247 @@
 import React, { useState, useEffect, useMemo } from "react";
-import { motion } from "framer-motion";
+import { motion, AnimatePresence } from "framer-motion";
 import {
   LineChart, Line, XAxis, YAxis, Tooltip, CartesianGrid,
   PieChart, Pie, Cell, BarChart, Bar, ResponsiveContainer,
-  AreaChart, Area
+  AreaChart, Area, RadarChart, PolarGrid, PolarAngleAxis, PolarRadiusAxis, Radar
 } from "recharts";
 
 export default function App() {
   const [handle, setHandle] = useState("");
   const [userData, setUserData] = useState(null);
-  const [submissions, setSubmissions] = useState([]);
   const [loading, setLoading] = useState(false);
   const [allSubmissions, setAllSubmissions] = useState([]);
+  const [upcomingContests, setUpcomingContests] = useState([]);
+  const [userContests, setUserContests] = useState([]);
+  const [contestLoading, setContestLoading] = useState(false);
+  const [currentPage, setCurrentPage] = useState(1);
+  const [submissionsPerPage] = useState(20);
+  const [recommendedProblems, setRecommendedProblems] = useState([]);
+  const [problemLoading, setProblemLoading] = useState(false);
+  const [selectedTags, setSelectedTags] = useState([]);
+  const [difficultyRange, setDifficultyRange] = useState([800, 3500]);
+  const [activeTab, setActiveTab] = useState("analytics");
 
-  const COLORS = ["#22c55e", "#ef4444", "#3b82f6", "#eab308", "#a855f7", "#06b6d4", "#f97316"];
+  const COLORS = ["#00ff88", "#ff0088", "#0088ff", "#ffaa00", "#aa00ff", "#00aaff", "#ff5500"];
 
-  // Fetch user profile + submissions
+  // Available problem tags
+  const algorithmCategories = {
+    "Basic Techniques": ["implementation", "math", "greedy", "brute force", "sortings"],
+    "Data Structures": ["data structures", "strings", "binary search", "two pointers"],
+    "Advanced Algorithms": ["dp", "graphs", "dfs and similar", "combinatorics"],
+    "Specialized": ["number theory", "geometry", "bitmasks", "constructive algorithms"]
+  };
+
+  // Fetch upcoming contests
+  const fetchUpcomingContests = async () => {
+    setContestLoading(true);
+    try {
+      const response = await fetch('https://codeforces.com/api/contest.list?gym=false');
+      const data = await response.json();
+
+      if (data.status === "OK") {
+        const upcoming = data.result
+          .filter(contest => contest.phase === "BEFORE")
+          .sort((a, b) => a.startTimeSeconds - b.startTimeSeconds)
+          .slice(0, 8);
+        setUpcomingContests(upcoming);
+      }
+    } catch (err) {
+      console.error("Failed to fetch contests:", err);
+    }
+    setContestLoading(false);
+  };
+
+  // Fetch user's contest history
+  const fetchUserContests = async (handle) => {
+    try {
+      const response = await fetch(`https://codeforces.com/api/user.rating?handle=${handle}`);
+      const data = await response.json();
+
+      if (data.status === "OK") {
+        setUserContests(data.result.reverse().slice(0, 20)); // Last 20 contests
+      }
+    } catch (err) {
+      console.error("Failed to fetch user contests:", err);
+    }
+  };
+
+  // Analyze patterns in wrong submissions
+  const analyzeWrongSubmissionPatterns = (wrongSubmissions) => {
+    const patterns = {};
+
+    wrongSubmissions.forEach(sub => {
+      const rating = sub.problem.rating;
+      sub.problem.tags?.forEach(tag => {
+        const key = `${tag}-${Math.round(rating / 100) * 100}`;
+        patterns[key] = (patterns[key] || 0) + 1;
+      });
+    });
+
+    return Object.entries(patterns)
+      .sort(([,a], [,b]) => b - a)
+      .slice(0, 5)
+      .map(([key]) => {
+        const [tag, rating] = key.split('-');
+        return { tag, rating: parseInt(rating) };
+      });
+  };
+
+  // Get recommendation reason
+  const getRecommendationReason = (problem, weakTags, wrongPatterns) => {
+    if (weakTags.some(tag => problem.tags?.includes(tag))) {
+      return "Targets your weak areas";
+    }
+    if (wrongPatterns.some(pattern =>
+      problem.tags?.includes(pattern.tag) &&
+      Math.abs(problem.rating - pattern.rating) <= 200
+    )) {
+      return "Similar to frequently wrong problems";
+    }
+    return "Matches your skill level";
+  };
+
+  // Calculate contest performance metrics
+  const calculateContestPerformance = (contests) => {
+    if (!contests.length) return null;
+
+    const performances = contests.map(contest => ({
+      ...contest,
+      ratingChange: contest.newRating - contest.oldRating,
+      performance: contest.newRating > contest.oldRating ? "Good" : "Needs Improvement"
+    }));
+
+    const avgRatingChange = performances.reduce((sum, p) => sum + p.ratingChange, 0) / performances.length;
+    const bestContest = performances.reduce((best, current) =>
+      current.ratingChange > best.ratingChange ? current : best
+    );
+    const worstContest = performances.reduce((worst, current) =>
+      current.ratingChange < worst.ratingChange ? current : worst
+    );
+
+    return {
+      performances,
+      avgRatingChange: Math.round(avgRatingChange),
+      bestContest,
+      worstContest,
+      totalContests: performances.length,
+      positivePerformance: performances.filter(p => p.ratingChange > 0).length
+    };
+  };
+
+  // Get user's weak tags based on performance
+  const getWeakTags = (tagStats, wrongTagStats) => {
+    return Object.entries(wrongTagStats)
+      .filter(([tag, wrongCount]) => {
+        const totalAttempts = (tagStats[tag] || 0) + wrongCount;
+        const successRate = totalAttempts > 0 ? (tagStats[tag] || 0) / totalAttempts : 0;
+        return successRate < 0.5 && totalAttempts >= 3;
+      })
+      .sort(([,a], [,b]) => a - b)
+      .slice(0, 5)
+      .map(([tag]) => tag);
+  };
+
+  // Get user's strong tags
+  const getStrongTags = (tagStats) => {
+    return Object.entries(tagStats)
+      .sort(([,a], [,b]) => b - a)
+      .slice(0, 5)
+      .map(([tag]) => tag);
+  };
+
+  // Fetch recommended problems based on weak areas and wrong submissions
+  const fetchRecommendedProblems = async (analyticsData, userRating, selectedTags, difficultyRange) => {
+    if (!userRating || !analyticsData) return;
+
+    setProblemLoading(true);
+    try {
+      const response = await fetch('https://codeforces.com/api/problemset.problems');
+      const data = await response.json();
+
+      if (data.status === "OK") {
+        const problems = data.result.problems;
+        const solvedProblems = new Set(
+          analyticsData.allSubmissions
+            .filter(s => s.verdict === "OK")
+            .map(s => `${s.problem.contestId}${s.problem.index}`)
+        );
+
+        // Get problems from weak tags and wrong question patterns
+        const weakTagProblems = problems.filter(problem => {
+          const problemId = `${problem.contestId}${problem.index}`;
+          const hasWeakTags = analyticsData.weakTags.some(tag => problem.tags?.includes(tag));
+          const inDifficultyRange = problem.rating &&
+            problem.rating >= difficultyRange[0] &&
+            problem.rating <= difficultyRange[1];
+          const hasSelectedTags = selectedTags.length === 0 ||
+            selectedTags.some(tag => problem.tags?.includes(tag));
+
+          return hasWeakTags && inDifficultyRange && hasSelectedTags && !solvedProblems.has(problemId);
+        });
+
+        // Get problems similar to wrong submissions
+        const wrongSubmissionPatterns = analyticsData.commonWrongPatterns;
+        const similarProblems = problems.filter(problem => {
+          const problemId = `${problem.contestId}${problem.index}`;
+          const matchesPattern = wrongSubmissionPatterns.some(pattern =>
+            problem.tags?.includes(pattern.tag) &&
+            Math.abs(problem.rating - pattern.rating) <= 200
+          );
+          return matchesPattern && !solvedProblems.has(problemId);
+        });
+
+        // Combine and prioritize
+        const recommended = [...weakTagProblems, ...similarProblems]
+          .sort((a, b) => {
+            // Prioritize problems close to user's level
+            const aDiff = Math.abs(a.rating - (userRating + 150));
+            const bDiff = Math.abs(b.rating - (userRating + 150));
+            return aDiff - bDiff;
+          })
+          .slice(0, 15)
+          .map(problem => ({
+            ...problem,
+            url: `https://codeforces.com/problemset/problem/${problem.contestId}/${problem.index}`,
+            recommendationReason: getRecommendationReason(problem, analyticsData.weakTags, wrongSubmissionPatterns)
+          }));
+
+        setRecommendedProblems(recommended);
+      }
+    } catch (err) {
+      console.error("Failed to fetch problems:", err);
+    }
+    setProblemLoading(false);
+  };
+
+  // Fetch data when component mounts
+  useEffect(() => {
+    fetchUpcomingContests();
+  }, []);
+
+  // Fetch user data
   const fetchData = async () => {
     if (!handle) return;
     setLoading(true);
+    setCurrentPage(1);
 
     try {
-      const userInfoRes = await fetch(
-        `https://codeforces.com/api/user.info?handles=${handle}`
-      );
-      const userInfo = await userInfoRes.json();
+      const [userInfoRes, statusRes] = await Promise.all([
+        fetch(`https://codeforces.com/api/user.info?handles=${handle}`),
+        fetch(`https://codeforces.com/api/user.status?handle=${handle}&from=1&count=1000`)
+      ]);
 
-      // Fetch more submissions for better analytics
-      const statusRes = await fetch(
-        `https://codeforces.com/api/user.status?handle=${handle}&from=1&count=1000`
-      );
+      const userInfo = await userInfoRes.json();
       const statusData = await statusRes.json();
 
-      setUserData(userInfo.result[0]);
-      setSubmissions(statusData.result.slice(0, 200)); // Recent 200 for table
-      setAllSubmissions(statusData.result); // All for analytics
+      if (userInfo.status === "OK" && statusData.status === "OK") {
+        setUserData(userInfo.result[0]);
+        setAllSubmissions(statusData.result);
+        fetchUserContests(handle);
+      }
     } catch (err) {
       console.error(err);
     }
-
     setLoading(false);
   };
 
@@ -47,6 +250,7 @@ export default function App() {
     if (allSubmissions.length === 0) return null;
 
     const solved = allSubmissions.filter((s) => s.verdict === "OK");
+    const wrongSubmissions = allSubmissions.filter((s) => s.verdict !== "OK");
     const total = allSubmissions.length;
     const accuracy = total ? ((solved.length / total) * 100).toFixed(2) : 0;
 
@@ -57,33 +261,26 @@ export default function App() {
       return acc;
     }, {});
 
-    // Daily activity heatmap (last 30 days)
-    const dailyActivity = {};
-    const thirtyDaysAgo = new Date();
-    thirtyDaysAgo.setDate(thirtyDaysAgo.getDate() - 30);
-
-    allSubmissions.forEach(sub => {
-      const date = new Date(sub.creationTimeSeconds * 1000).toDateString();
-      if (new Date(sub.creationTimeSeconds * 1000) >= thirtyDaysAgo) {
-        dailyActivity[date] = (dailyActivity[date] || 0) + 1;
-      }
-    });
-
     // Problem tags analysis
     const tagStats = {};
     solved.forEach(sub => {
-      sub.problem.tags.forEach(tag => {
+      sub.problem.tags?.forEach(tag => {
         tagStats[tag] = (tagStats[tag] || 0) + 1;
+      });
+    });
+
+    // Wrong submissions analysis
+    const wrongTagStats = {};
+    wrongSubmissions.forEach(sub => {
+      sub.problem.tags?.forEach(tag => {
+        wrongTagStats[tag] = (wrongTagStats[tag] || 0) + 1;
       });
     });
 
     // Rating progress over time
     const ratingProgress = [];
     const uniqueSolved = new Set();
-    const ratingTimeline = [];
-    let currentRating = 0;
 
-    // Sort by time and track rating changes
     const timeSorted = [...allSubmissions].sort((a, b) => a.creationTimeSeconds - b.creationTimeSeconds);
 
     timeSorted.forEach(sub => {
@@ -101,426 +298,666 @@ export default function App() {
       }
     });
 
-    // Contest performance
-    const contestStats = allSubmissions
-      .filter(sub => sub.author.participantType === "CONTESTANT")
-      .reduce((acc, sub) => {
-        const contestId = sub.contestId;
-        if (!acc[contestId]) {
-          acc[contestId] = { solved: 0, total: 0, rating: sub.problem.rating || 0 };
-        }
-        if (sub.verdict === "OK") acc[contestId].solved++;
-        acc[contestId].total++;
-        return acc;
-      }, {});
+    // Performance by hour
+    const hourlyPerformance = Array.from({ length: 24 }, (_, i) => ({ hour: i, submissions: 0, solved: 0 }));
+    allSubmissions.forEach(sub => {
+      const hour = new Date(sub.creationTimeSeconds * 1000).getHours();
+      hourlyPerformance[hour].submissions++;
+      if (sub.verdict === "OK") hourlyPerformance[hour].solved++;
+    });
 
     // Streak calculation
+    const uniqueDays = new Set();
+    timeSorted.forEach(sub => {
+      const date = new Date(sub.creationTimeSeconds * 1000).toDateString();
+      if (sub.verdict === "OK") uniqueDays.add(date);
+    });
+
+    const sortedDays = Array.from(uniqueDays).sort();
     let currentStreak = 0;
     let maxStreak = 0;
     let tempStreak = 0;
-    const uniqueDays = new Set();
 
-    timeSorted.forEach(sub => {
-      const date = new Date(sub.creationTimeSeconds * 1000).toDateString();
-      if (sub.verdict === "OK" && !uniqueDays.has(date)) {
-        uniqueDays.add(date);
+    for (let i = 0; i < sortedDays.length; i++) {
+      if (i === 0 || new Date(sortedDays[i]) - new Date(sortedDays[i - 1]) === 86400000) {
         tempStreak++;
-        maxStreak = Math.max(maxStreak, tempStreak);
+      } else {
+        tempStreak = 1;
       }
-    });
+      maxStreak = Math.max(maxStreak, tempStreak);
+    }
+    currentStreak = tempStreak;
 
-    // Recent activity streak (last 7 days)
-    const recentDays = new Set();
-    const last7Days = Array.from({length: 7}, (_, i) => {
-      const date = new Date();
-      date.setDate(date.getDate() - i);
-      return date.toDateString();
-    });
+    // Weak tags (tags with low success rate)
+    const weakTags = getWeakTags(tagStats, wrongTagStats);
 
-    timeSorted.forEach(sub => {
-      const date = new Date(sub.creationTimeSeconds * 1000).toDateString();
-      if (last7Days.includes(date) && sub.verdict === "OK") {
-        recentDays.add(date);
-      }
-    });
-    currentStreak = recentDays.size;
+    // Strong tags
+    const strongTags = getStrongTags(tagStats);
+
+    // Common wrong patterns
+    const commonWrongPatterns = analyzeWrongSubmissionPatterns(wrongSubmissions);
 
     return {
       solved: solved.length,
       total,
       accuracy,
       difficultyDistribution,
-      dailyActivity,
       tagStats,
+      wrongTagStats,
       ratingProgress,
-      contestStats,
-      streaks: {
-        current: currentStreak,
-        max: maxStreak
-      },
+      hourlyPerformance,
+      streaks: { current: currentStreak, max: maxStreak },
       averageDifficulty: solved.length > 0 ?
         Math.round(solved.reduce((sum, sub) => sum + (sub.problem.rating || 0), 0) / solved.length) : 0,
-      uniqueSolved: uniqueSolved.size
+      uniqueSolved: uniqueSolved.size,
+      strongTags,
+      weakTags,
+      wrongSubmissions,
+      commonWrongPatterns,
+      successRateByHour: hourlyPerformance.map(h => ({
+        hour: h.hour,
+        successRate: h.submissions > 0 ? (h.solved / h.submissions) * 100 : 0
+      })),
+      allSubmissions // Include for recommendations
     };
   }, [allSubmissions]);
 
-  // Verdict Statistics
-  const verdictStats = [
-    { name: "Accepted", value: submissions.filter((s) => s.verdict === "OK").length },
-    { name: "Wrong Answer", value: submissions.filter((s) => s.verdict === "WRONG_ANSWER").length },
-    { name: "TLE", value: submissions.filter((s) => s.verdict === "TIME_LIMIT_EXCEEDED").length },
-    { name: "MLE", value: submissions.filter((s) => s.verdict === "MEMORY_LIMIT_EXCEEDED").length },
-    { name: "Runtime Error", value: submissions.filter((s) => s.verdict === "RUNTIME_ERROR").length },
-    { name: "Compilation Error", value: submissions.filter((s) => s.verdict === "COMPILATION_ERROR").length },
-    { name: "Other", value: submissions.filter((s) => !["OK","WRONG_ANSWER","TIME_LIMIT_EXCEEDED","MEMORY_LIMIT_EXCEEDED","RUNTIME_ERROR","COMPILATION_ERROR"].includes(s.verdict)).length },
-  ];
+  // Contest performance analysis
+  const contestPerformance = useMemo(() => {
+    return calculateContestPerformance(userContests);
+  }, [userContests]);
 
-  // XP + Gamification
-  const xp = submissions.filter(s => s.verdict === "OK").length * 10;
-  const level = Math.floor(xp / 500) + 1;
-  const nextLevelXp = level * 500;
-  const progress = ((xp % 500) / 500) * 100;
-
-  const badges = [];
-  const solvedCount = submissions.filter(s => s.verdict === "OK").length;
-  if (solvedCount >= 50) badges.push({ name: "Thinker", icon: "🧠", description: "Solved 50+ problems" });
-  if (solvedCount >= 100) badges.push({ name: "Sprinter", icon: "🥇", description: "Solved 100+ problems" });
-  if (analytics?.accuracy >= 60) badges.push({ name: "Sharpshooter", icon: "🎯", description: "60%+ accuracy" });
-  if (analytics?.streaks.current >= 7) badges.push({ name: "Consistent", icon: "🔥", description: "7-day streak" });
-  if (analytics?.averageDifficulty >= 1600) badges.push({ name: "Challenger", icon: "⚔️", description: "Hard problems solver" });
-
-  // Problem tags for chart
-  const tagChartData = analytics ?
-    Object.entries(analytics.tagStats)
-      .sort((a, b) => b[1] - a[1])
-      .slice(0, 8)
-      .map(([tag, count]) => ({ tag, count })) : [];
-
-  // Difficulty distribution for chart
-  const difficultyChartData = analytics ?
-    Object.entries(analytics.difficultyDistribution)
-      .filter(([rating]) => rating !== "Unknown")
-      .sort(([a], [b]) => parseInt(a) - parseInt(b))
-      .map(([rating, count]) => ({ rating: `${rating}`, count })) : [];
+  // Fetch recommended problems when analytics change
+  useEffect(() => {
+    if (analytics && userData?.rating) {
+      fetchRecommendedProblems(analytics, userData.rating, selectedTags, difficultyRange);
+    }
+  }, [analytics, userData, selectedTags, difficultyRange]);
 
   return (
-    <div className="min-h-screen bg-gray-950 text-white p-6">
-      <h1 className="text-3xl font-bold text-center mb-6">
-        🚀 Codeforces Analytics Pro
-      </h1>
+    <div className="min-h-screen bg-gray-950 text-white p-4">
+      {/* Header */}
+      <motion.header
+        initial={{ opacity: 0, y: -50 }}
+        animate={{ opacity: 1, y: 0 }}
+        className="text-center mb-8"
+      >
+        <h1 className="text-4xl font-bold bg-gradient-to-r from-cyan-400 to-blue-500 bg-clip-text text-transparent mb-2">
+          🔥 Codeforces Advanced Analytics
+        </h1>
+        <p className="text-gray-400">Deep insights beyond standard metrics</p>
+      </motion.header>
 
-      {/* Input */}
-      <div className="flex justify-center mb-6">
-        <input
-          type="text"
-          placeholder="Enter Codeforces handle"
-          value={handle}
-          onChange={(e) => setHandle(e.target.value)}
-          className="px-4 py-2 rounded-l-lg text-black w-64"
-        />
-        <button
-          onClick={fetchData}
-          className="px-4 py-2 bg-indigo-600 rounded-r-lg hover:bg-indigo-700"
+      {/* Input Section */}
+      <motion.div
+        initial={{ opacity: 0, scale: 0.9 }}
+        animate={{ opacity: 1, scale: 1 }}
+        className="flex justify-center mb-8"
+      >
+        <div className="flex gap-4">
+          <input
+            type="text"
+            placeholder="Enter your Codeforces handle..."
+            value={handle}
+            onChange={(e) => setHandle(e.target.value)}
+            className="px-6 py-3 rounded-xl bg-gray-900 border border-gray-700 text-white placeholder-gray-500 focus:outline-none focus:border-cyan-400 w-80"
+          />
+          <button
+            onClick={fetchData}
+            className="px-8 py-3 bg-gradient-to-r from-cyan-500 to-blue-500 rounded-xl hover:from-cyan-600 hover:to-blue-600 transition-all font-bold"
+          >
+            Analyze
+          </button>
+        </div>
+      </motion.div>
+
+      {/* Navigation Tabs */}
+      {userData && (
+        <motion.div
+          initial={{ opacity: 0 }}
+          animate={{ opacity: 1 }}
+          className="flex justify-center mb-8"
         >
-          Analyze
-        </button>
-      </div>
+          <div className="bg-gray-900 rounded-xl p-1 flex flex-wrap gap-1">
+            {["analytics", "recommendations", "contests", "submissions", "wrong-questions"].map((tab) => (
+              <button
+                key={tab}
+                onClick={() => setActiveTab(tab)}
+                className={`px-4 py-2 rounded-lg capitalize transition-all text-sm ${
+                  activeTab === tab
+                    ? "bg-gradient-to-r from-cyan-500 to-blue-500 text-white"
+                    : "text-gray-400 hover:text-white"
+                }`}
+              >
+                {tab.replace('-', ' ')}
+              </button>
+            ))}
+          </div>
+        </motion.div>
+      )}
 
       {loading && (
         <div className="text-center">
-          <div className="inline-block animate-spin rounded-full h-8 w-8 border-b-2 border-white"></div>
-          <p className="mt-2">Crunching numbers...</p>
+          <div className="inline-block animate-spin rounded-full h-12 w-12 border-b-2 border-cyan-400"></div>
+          <p className="mt-4 text-cyan-400">Analyzing performance data...</p>
         </div>
       )}
 
-      {userData && analytics && (
-        <div className="space-y-8">
-          {/* Profile Section */}
+      <AnimatePresence>
+        {userData && analytics && (
           <motion.div
-            initial={{ opacity: 0, y: 50 }}
-            animate={{ opacity: 1, y: 0 }}
-            className="bg-gray-900 p-6 rounded-2xl shadow-lg"
+            initial={{ opacity: 0 }}
+            animate={{ opacity: 1 }}
+            exit={{ opacity: 0 }}
+            className="space-y-8"
           >
-            <div className="flex justify-between items-center">
-              <div>
-                <h2 className="text-2xl font-bold mb-2">{userData.handle}</h2>
-                <p className="text-gray-300">
-                  Rating: <span className="text-white">{userData.rating || "Unrated"}</span>
-                  (Max: <span className="text-white">{userData.maxRating || "N/A"}</span>)
-                </p>
-                <p className="text-gray-300">
-                  Rank: <span className="text-white">{userData.rank}</span> |
-                  Max Rank: <span className="text-white">{userData.maxRank}</span>
-                </p>
-              </div>
-              <div className="text-right">
-                <div className="text-lg font-bold text-green-400">
-                  {analytics.streaks.current} day streak 🔥
+            {/* Analytics Dashboard */}
+            {activeTab === "analytics" && (
+              <div className="space-y-8">
+                {/* Profile Card */}
+                <motion.div
+                  initial={{ opacity: 0, y: 20 }}
+                  animate={{ opacity: 1, y: 0 }}
+                  className="bg-gray-900 rounded-2xl p-6 border border-gray-800"
+                >
+                  <div className="flex flex-col lg:flex-row justify-between items-start lg:items-center gap-4">
+                    <div>
+                      <h2 className="text-2xl font-bold mb-2">{userData.handle}</h2>
+                      <div className="flex flex-wrap gap-4 text-sm">
+                        <div>
+                          <span className="text-gray-400">Rating: </span>
+                          <span className="text-cyan-400 font-bold">{userData.rating || "Unrated"}</span>
+                        </div>
+                        <div>
+                          <span className="text-gray-400">Max: </span>
+                          <span className="text-blue-400">{userData.maxRating || "N/A"}</span>
+                        </div>
+                        <div>
+                          <span className="text-gray-400">Rank: </span>
+                          <span className="text-green-400">{userData.rank}</span>
+                        </div>
+                      </div>
+                    </div>
+                    <div className="text-right">
+                      <div className="text-lg font-bold text-green-400">
+                        {analytics.streaks.current} day streak 🔥
+                      </div>
+                      <div className="text-sm text-gray-400">
+                        Max: {analytics.streaks.max} days
+                      </div>
+                    </div>
+                  </div>
+                </motion.div>
+
+                {/* Stats Grid */}
+                <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
+                  {[
+                    { label: "Unique Solved", value: analytics.uniqueSolved, color: "from-cyan-500 to-blue-500" },
+                    { label: "Accuracy", value: `${analytics.accuracy}%`, color: "from-green-500 to-emerald-500" },
+                    { label: "Avg Difficulty", value: analytics.averageDifficulty, color: "from-purple-500 to-pink-500" },
+                    { label: "Total Submissions", value: analytics.total, color: "from-orange-500 to-red-500" }
+                  ].map((stat, idx) => (
+                    <motion.div
+                      key={stat.label}
+                      initial={{ opacity: 0, scale: 0.9 }}
+                      animate={{ opacity: 1, scale: 1 }}
+                      transition={{ delay: idx * 0.1 }}
+                      className={`bg-gradient-to-br ${stat.color} rounded-xl p-4 text-white`}
+                    >
+                      <div className="text-2xl font-bold">{stat.value}</div>
+                      <div className="text-sm opacity-90">{stat.label}</div>
+                    </motion.div>
+                  ))}
                 </div>
-                <div className="text-sm text-gray-300">
-                  Max: {analytics.streaks.max} days
-                </div>
-              </div>
-            </div>
-          </motion.div>
 
-          {/* Quick Stats Grid */}
-          <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
-            <motion.div
-              initial={{ opacity: 0, scale: 0.9 }}
-              animate={{ opacity: 1, scale: 1 }}
-              className="bg-blue-500 p-4 rounded-xl text-center"
-            >
-              <div className="text-2xl font-bold">{analytics.uniqueSolved}</div>
-              <div className="text-sm">Unique Solved</div>
-            </motion.div>
-            <motion.div
-              initial={{ opacity: 0, scale: 0.9 }}
-              animate={{ opacity: 1, scale: 1 }}
-              transition={{ delay: 0.1 }}
-              className="bg-green-500 p-4 rounded-xl text-center"
-            >
-              <div className="text-2xl font-bold">{analytics.accuracy}%</div>
-              <div className="text-sm">Accuracy</div>
-            </motion.div>
-            <motion.div
-              initial={{ opacity: 0, scale: 0.9 }}
-              animate={{ opacity: 1, scale: 1 }}
-              transition={{ delay: 0.2 }}
-              className="bg-purple-500 p-4 rounded-xl text-center"
-            >
-              <div className="text-2xl font-bold">{analytics.averageDifficulty}</div>
-              <div className="text-sm">Avg Difficulty</div>
-            </motion.div>
-            <motion.div
-              initial={{ opacity: 0, scale: 0.9 }}
-              animate={{ opacity: 1, scale: 1 }}
-              transition={{ delay: 0.3 }}
-              className="bg-orange-500 p-4 rounded-xl text-center"
-            >
-              <div className="text-2xl font-bold">{analytics.total}</div>
-              <div className="text-sm">Total Submissions</div>
-            </motion.div>
-          </div>
-
-          {/* Gamification */}
-          <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
-            <motion.div
-              initial={{ opacity: 0, y: 50 }}
-              animate={{ opacity: 1, y: 0 }}
-              className="p-6 bg-gradient-to-r from-purple-500 to-indigo-600 rounded-2xl shadow-lg text-white"
-            >
-              <h2 className="text-xl font-bold mb-2">XP Progress</h2>
-              <p>Level {level}</p>
-              <div className="w-full bg-white/20 rounded-full h-4 mt-2">
-                <div
-                  className="bg-yellow-400 h-4 rounded-full transition-all"
-                  style={{ width: `${progress}%` }}
-                />
-              </div>
-              <p className="mt-2">{xp} / {nextLevelXp} XP</p>
-            </motion.div>
-
-            <motion.div
-              initial={{ opacity: 0, y: 50 }}
-              animate={{ opacity: 1, y: 0 }}
-              className="p-6 bg-gray-900 rounded-2xl shadow-lg"
-            >
-              <h2 className="text-xl font-bold mb-4">Badges & Achievements</h2>
-              <div className="grid grid-cols-2 sm:grid-cols-3 gap-3">
-                {badges.length ? badges.map((badge, idx) => (
+                {/* Advanced Insights */}
+                <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
+                  {/* Weak Areas */}
                   <motion.div
-                    key={idx}
-                    whileHover={{ scale: 1.05 }}
-                    className="p-3 bg-gray-800 rounded-xl text-center group relative"
+                    initial={{ opacity: 0, x: -20 }}
+                    animate={{ opacity: 1, x: 0 }}
+                    className="bg-gray-900 rounded-2xl p-6 border border-gray-800"
                   >
-                    <span className="text-2xl">{badge.icon}</span>
-                    <p className="text-sm mt-1 font-medium">{badge.name}</p>
-                    <div className="absolute bottom-full mb-2 hidden group-hover:block bg-black text-white p-2 rounded text-xs w-32">
-                      {badge.description}
+                    <h3 className="text-xl font-bold mb-4 text-red-400">Areas Needing Improvement</h3>
+                    <div className="space-y-3">
+                      {analytics.weakTags.length > 0 ? (
+                        analytics.weakTags.map((tag, idx) => (
+                          <div key={tag} className="flex justify-between items-center">
+                            <span className="text-sm">{tag}</span>
+                            <div className="flex gap-2 text-xs">
+                              <span className="text-green-400">
+                                ✓ {analytics.tagStats[tag] || 0}
+                              </span>
+                              <span className="text-red-400">
+                                ✗ {analytics.wrongTagStats[tag] || 0}
+                              </span>
+                            </div>
+                          </div>
+                        ))
+                      ) : (
+                        <p className="text-gray-400 text-sm">No significant weak areas detected</p>
+                      )}
                     </div>
                   </motion.div>
-                )) : <p className="text-gray-400">Keep solving to earn badges!</p>}
-              </div>
-            </motion.div>
-          </div>
 
-          {/* Advanced Analytics */}
-          <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
-            {/* Problem Solving Progress */}
-            <motion.div
-              initial={{ opacity: 0, x: -50 }}
-              animate={{ opacity: 1, x: 0 }}
-              className="p-6 bg-gray-900 rounded-2xl shadow-lg"
-            >
-              <h2 className="text-xl font-bold mb-4">Problem Solving Progress</h2>
-              <ResponsiveContainer width="100%" height={300}>
-                <AreaChart data={analytics.ratingProgress.slice(-30)}>
-                  <CartesianGrid strokeDasharray="3 3" stroke="#374151" />
-                  <XAxis dataKey="date" stroke="#9CA3AF" />
-                  <YAxis stroke="#9CA3AF" />
-                  <Tooltip
-                    contentStyle={{ backgroundColor: '#1F2937', border: 'none' }}
-                  />
-                  <Area
-                    type="monotone"
-                    dataKey="problems"
-                    stroke="#3B82F6"
-                    fill="#3B82F6"
-                    fillOpacity={0.2}
-                  />
-                </AreaChart>
-              </ResponsiveContainer>
-            </motion.div>
-
-            {/* Difficulty Distribution */}
-            <motion.div
-              initial={{ opacity: 0, x: 50 }}
-              animate={{ opacity: 1, x: 0 }}
-              className="p-6 bg-gray-900 rounded-2xl shadow-lg"
-            >
-              <h2 className="text-xl font-bold mb-4">Difficulty Distribution</h2>
-              <ResponsiveContainer width="100%" height={300}>
-                <BarChart data={difficultyChartData}>
-                  <CartesianGrid strokeDasharray="3 3" stroke="#374151" />
-                  <XAxis dataKey="rating" stroke="#9CA3AF" />
-                  <YAxis stroke="#9CA3AF" />
-                  <Tooltip
-                    contentStyle={{ backgroundColor: '#1F2937', border: 'none' }}
-                  />
-                  <Bar dataKey="count" fill="#10B981" />
-                </BarChart>
-              </ResponsiveContainer>
-            </motion.div>
-
-            {/* Tag Distribution */}
-            <motion.div
-              initial={{ opacity: 0, y: 50 }}
-              animate={{ opacity: 1, y: 0 }}
-              className="p-6 bg-gray-900 rounded-2xl shadow-lg"
-            >
-              <h2 className="text-xl font-bold mb-4">Top Problem Tags</h2>
-              <ResponsiveContainer width="100%" height={300}>
-                <BarChart data={tagChartData} layout="vertical">
-                  <CartesianGrid strokeDasharray="3 3" stroke="#374151" />
-                  <XAxis type="number" stroke="#9CA3AF" />
-                  <YAxis type="category" dataKey="tag" stroke="#9CA3AF" width={80} />
-                  <Tooltip
-                    contentStyle={{ backgroundColor: '#1F2937', border: 'none' }}
-                  />
-                  <Bar dataKey="count" fill="#8B5CF6" />
-                </BarChart>
-              </ResponsiveContainer>
-            </motion.div>
-
-            {/* Verdict Distribution */}
-            <motion.div
-              initial={{ opacity: 0, y: 50 }}
-              animate={{ opacity: 1, y: 0 }}
-              className="p-6 bg-gray-900 rounded-2xl shadow-lg"
-            >
-              <h2 className="text-xl font-bold mb-4">Verdict Distribution</h2>
-              <ResponsiveContainer width="100%" height={300}>
-                <PieChart>
-                  <Pie
-                    data={verdictStats}
-                    cx="50%"
-                    cy="50%"
-                    labelLine={false}
-                    label={({ name, percent }) => `${name} (${(percent * 100).toFixed(0)}%)`}
-                    outerRadius={100}
-                    fill="#8884d8"
-                    dataKey="value"
+                  {/* Strong Areas */}
+                  <motion.div
+                    initial={{ opacity: 0, x: 20 }}
+                    animate={{ opacity: 1, x: 0 }}
+                    className="bg-gray-900 rounded-2xl p-6 border border-gray-800"
                   >
-                    {verdictStats.map((entry, index) => (
-                      <Cell key={`cell-${index}`} fill={COLORS[index % COLORS.length]} />
+                    <h3 className="text-xl font-bold mb-4 text-green-400">Strong Areas</h3>
+                    <div className="space-y-3">
+                      {analytics.strongTags.map((tag, idx) => (
+                        <div key={tag} className="flex justify-between items-center">
+                          <span className="text-sm">{tag}</span>
+                          <span className="text-green-400 font-bold">
+                            {analytics.tagStats[tag]} solved
+                          </span>
+                        </div>
+                      ))}
+                    </div>
+                  </motion.div>
+                </div>
+
+                {/* Performance Charts */}
+                <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
+                  <motion.div
+                    initial={{ opacity: 0, y: 20 }}
+                    animate={{ opacity: 1, y: 0 }}
+                    className="bg-gray-900 rounded-2xl p-6 border border-gray-800"
+                  >
+                    <h3 className="text-xl font-bold mb-4">Progress Timeline</h3>
+                    <ResponsiveContainer width="100%" height={300}>
+                      <AreaChart data={analytics.ratingProgress.slice(-30)}>
+                        <CartesianGrid strokeDasharray="3 3" stroke="#374151" />
+                        <XAxis dataKey="date" stroke="#9CA3AF" />
+                        <YAxis stroke="#9CA3AF" />
+                        <Tooltip
+                          contentStyle={{ backgroundColor: '#1F2937', border: 'none', borderRadius: '8px' }}
+                        />
+                        <Area
+                          type="monotone"
+                          dataKey="problems"
+                          stroke="#06b6d4"
+                          fill="#06b6d4"
+                          fillOpacity={0.2}
+                        />
+                      </AreaChart>
+                    </ResponsiveContainer>
+                  </motion.div>
+
+                  <motion.div
+                    initial={{ opacity: 0, y: 20 }}
+                    animate={{ opacity: 1, y: 0 }}
+                    className="bg-gray-900 rounded-2xl p-6 border border-gray-800"
+                  >
+                    <h3 className="text-xl font-bold mb-4">Success Rate by Hour</h3>
+                    <ResponsiveContainer width="100%" height={300}>
+                      <BarChart data={analytics.successRateByHour}>
+                        <CartesianGrid strokeDasharray="3 3" stroke="#374151" />
+                        <XAxis dataKey="hour" stroke="#9CA3AF" />
+                        <YAxis stroke="#9CA3AF" />
+                        <Tooltip
+                          contentStyle={{ backgroundColor: '#1F2937', border: 'none', borderRadius: '8px' }}
+                          formatter={(value) => [`${value.toFixed(1)}%`, 'Success Rate']}
+                        />
+                        <Bar dataKey="successRate" fill="#10B981" />
+                      </BarChart>
+                    </ResponsiveContainer>
+                  </motion.div>
+                </div>
+              </div>
+            )}
+
+            {/* Recommendations */}
+            {activeTab === "recommendations" && (
+              <motion.div
+                initial={{ opacity: 0 }}
+                animate={{ opacity: 1 }}
+                className="space-y-6"
+              >
+                {/* Filters */}
+                <div className="bg-gray-900 rounded-2xl p-6 border border-gray-800">
+                  <h3 className="text-xl font-bold mb-4">Customize Recommendations</h3>
+                  <div className="space-y-4">
+                    <div>
+                      <label className="block text-sm font-medium mb-2">
+                        Difficulty Range: {difficultyRange[0]} - {difficultyRange[1]}
+                      </label>
+                      <input
+                        type="range"
+                        min="800"
+                        max="3500"
+                        step="100"
+                        value={difficultyRange[1]}
+                        onChange={(e) => setDifficultyRange([difficultyRange[0], parseInt(e.target.value)])}
+                        className="w-full"
+                      />
+                    </div>
+                    <div>
+                      <label className="block text-sm font-medium mb-2">Algorithm Categories</label>
+                      <div className="space-y-3">
+                        {Object.entries(algorithmCategories).map(([category, tags]) => (
+                          <div key={category}>
+                            <h4 className="text-cyan-400 font-bold mb-2">{category}</h4>
+                            <div className="flex flex-wrap gap-2">
+                              {tags.map(tag => (
+                                <button
+                                  key={tag}
+                                  onClick={() => setSelectedTags(prev =>
+                                    prev.includes(tag)
+                                      ? prev.filter(t => t !== tag)
+                                      : [...prev, tag]
+                                  )}
+                                  className={`px-3 py-1 rounded-full text-sm transition-all ${
+                                    selectedTags.includes(tag)
+                                      ? "bg-cyan-500 text-white"
+                                      : "bg-gray-800 text-gray-300 hover:bg-gray-700"
+                                  }`}
+                                >
+                                  {tag}
+                                </button>
+                              ))}
+                            </div>
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                  </div>
+                </div>
+
+                {/* Recommended Problems */}
+                <div className="grid gap-4">
+                  {problemLoading ? (
+                    <div className="text-center py-12">
+                      <div className="inline-block animate-spin rounded-full h-8 w-8 border-b-2 border-cyan-400"></div>
+                      <p className="mt-4 text-cyan-400">Finding optimal challenges...</p>
+                    </div>
+                  ) : recommendedProblems.length > 0 ? (
+                    recommendedProblems.map((problem, index) => (
+                      <motion.div
+                        key={`${problem.contestId}-${problem.index}`}
+                        initial={{ opacity: 0, y: 20 }}
+                        animate={{ opacity: 1, y: 0 }}
+                        transition={{ delay: index * 0.1 }}
+                        className="bg-gray-900 rounded-2xl p-6 border border-gray-800 hover:border-cyan-500 transition-all"
+                      >
+                        <div className="flex flex-col lg:flex-row justify-between items-start gap-4">
+                          <div className="flex-1">
+                            <div className="flex items-center gap-3 mb-3 flex-wrap">
+                              <h3 className="text-lg font-bold">{problem.name}</h3>
+                              <span className="px-3 py-1 bg-purple-500 rounded-full text-xs font-bold">
+                                {problem.rating} Rating
+                              </span>
+                            </div>
+
+                            <div className="flex items-center gap-4 mb-3 text-sm">
+                              <span className="text-cyan-400 font-bold">
+                                {problem.recommendationReason}
+                              </span>
+                              <span className="text-gray-400">
+                                Contest: {problem.contestId}
+                              </span>
+                            </div>
+
+                            {problem.tags && (
+                              <div className="flex flex-wrap gap-1">
+                                {problem.tags.slice(0, 4).map(tag => (
+                                  <span
+                                    key={tag}
+                                    className="px-2 py-1 bg-gray-800 rounded text-xs text-gray-300"
+                                  >
+                                    {tag}
+                                  </span>
+                                ))}
+                              </div>
+                            )}
+                          </div>
+
+                          <a
+                            href={problem.url}
+                            target="_blank"
+                            rel="noopener noreferrer"
+                            className="px-6 py-2 bg-gradient-to-r from-cyan-500 to-blue-500 rounded-lg hover:from-cyan-600 hover:to-blue-600 transition-all font-bold whitespace-nowrap"
+                          >
+                            Solve Problem
+                          </a>
+                        </div>
+                      </motion.div>
+                    ))
+                  ) : (
+                    <div className="text-center py-12 text-gray-400">
+                      No problems found matching your criteria. Try adjusting filters.
+                    </div>
+                  )}
+                </div>
+              </motion.div>
+            )}
+
+            {/* Contests */}
+            {activeTab === "contests" && (
+              <motion.div
+                initial={{ opacity: 0 }}
+                animate={{ opacity: 1 }}
+                className="space-y-8"
+              >
+                {/* Upcoming Contests */}
+                <div className="bg-gray-900 rounded-2xl p-6 border border-gray-800">
+                  <h3 className="text-xl font-bold mb-4">🏆 Upcoming Contests</h3>
+                  <div className="grid gap-4">
+                    {upcomingContests.map((contest, index) => (
+                      <motion.div
+                        key={contest.id}
+                        initial={{ opacity: 0, y: 20 }}
+                        animate={{ opacity: 1, y: 0 }}
+                        transition={{ delay: index * 0.1 }}
+                        className="bg-gray-800 rounded-xl p-4 hover:bg-gray-750 transition-all"
+                      >
+                        <div className="flex flex-col lg:flex-row justify-between items-start gap-4">
+                          <div className="flex-1">
+                            <div className="flex items-center gap-3 mb-2 flex-wrap">
+                              <h4 className="font-bold text-lg">{contest.name}</h4>
+                              <span className="px-2 py-1 bg-cyan-500 rounded text-xs font-bold">
+                                {contest.type || "Rated"}
+                              </span>
+                            </div>
+                            <div className="text-sm text-gray-300 space-y-1">
+                              <div>📅 {new Date(contest.startTimeSeconds * 1000).toLocaleString()}</div>
+                              <div>⏱️ Duration: {Math.floor(contest.durationSeconds / 3600)}h {Math.floor((contest.durationSeconds % 3600) / 60)}m</div>
+                            </div>
+                          </div>
+                          <div className="flex flex-col items-end gap-2">
+                            <div className="text-right">
+                              <div className="text-xl font-bold text-green-400">
+                                {Math.floor((contest.startTimeSeconds - Date.now()/1000) / 86400)}d
+                              </div>
+                              <div className="text-sm text-gray-400">until start</div>
+                            </div>
+                            <a
+                              href={`https://codeforces.com/contests`}
+                              target="_blank"
+                              rel="noopener noreferrer"
+                              className="px-4 py-2 bg-green-500 rounded-lg hover:bg-green-600 transition-all text-sm font-bold"
+                            >
+                              Register
+                            </a>
+                          </div>
+                        </div>
+                      </motion.div>
                     ))}
-                  </Pie>
-                  <Tooltip
-                    contentStyle={{ backgroundColor: '#1F2937', border: 'none' }}
-                  />
-                </PieChart>
-              </ResponsiveContainer>
-            </motion.div>
-          </div>
+                  </div>
+                </div>
 
-          {/* Performance Insights */}
-          <motion.div
-            initial={{ opacity: 0, y: 50 }}
-            animate={{ opacity: 1, y: 0 }}
-            className="p-6 bg-gray-900 rounded-2xl shadow-lg"
-          >
-            <h2 className="text-xl font-bold mb-4">Performance Insights</h2>
-            <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-              <div className="p-4 bg-gray-800 rounded-lg">
-                <h3 className="font-bold text-green-400 mb-2">Strengths</h3>
-                <ul className="text-sm space-y-1">
-                  {tagChartData.slice(0, 3).map((tag, idx) => (
-                    <li key={idx}>• Strong in {tag.tag} ({tag.count} solved)</li>
-                  ))}
-                  {analytics.streaks.current >= 3 && (
-                    <li>• Consistent practice ({analytics.streaks.current} day streak)</li>
-                  )}
-                  {analytics.accuracy >= 70 && (
-                    <li>• High accuracy rate ({analytics.accuracy}%)</li>
-                  )}
-                </ul>
-              </div>
-              <div className="p-4 bg-gray-800 rounded-lg">
-                <h3 className="font-bold text-red-400 mb-2">Areas to Improve</h3>
-                <ul className="text-sm space-y-1">
-                  {tagChartData.length > 3 && (
-                    <li>• Explore {tagChartData.slice(-3).map(t => t.tag).join(', ')}</li>
-                  )}
-                  {analytics.averageDifficulty < 1400 && (
-                    <li>• Try more challenging problems</li>
-                  )}
-                  {analytics.accuracy < 50 && (
-                    <li>• Focus on problem understanding before coding</li>
-                  )}
-                </ul>
-              </div>
-            </div>
+                {/* User Contest History */}
+                {contestPerformance && (
+                  <div className="bg-gray-900 rounded-2xl p-6 border border-gray-800">
+                    <h3 className="text-xl font-bold mb-4">📊 Your Contest Performance</h3>
+                    <div className="grid grid-cols-1 md:grid-cols-3 gap-4 mb-6">
+                      <div className="bg-gray-800 rounded-xl p-4 text-center">
+                        <div className="text-2xl font-bold text-cyan-400">{contestPerformance.totalContests}</div>
+                        <div className="text-sm text-gray-400">Total Contests</div>
+                      </div>
+                      <div className="bg-gray-800 rounded-xl p-4 text-center">
+                        <div className={`text-2xl font-bold ${contestPerformance.avgRatingChange >= 0 ? 'text-green-400' : 'text-red-400'}`}>
+                          {contestPerformance.avgRatingChange >= 0 ? '+' : ''}{contestPerformance.avgRatingChange}
+                        </div>
+                        <div className="text-sm text-gray-400">Avg Rating Change</div>
+                      </div>
+                      <div className="bg-gray-800 rounded-xl p-4 text-center">
+                        <div className="text-2xl font-bold text-green-400">{contestPerformance.positivePerformance}</div>
+                        <div className="text-sm text-gray-400">Positive Performances</div>
+                      </div>
+                    </div>
+
+                    <div className="space-y-3">
+                      {contestPerformance.performances.slice(0, 10).map((contest, idx) => (
+                        <div key={contest.contestId} className="flex justify-between items-center p-3 bg-gray-800 rounded-lg">
+                          <div>
+                            <div className="font-medium">{contest.contestName}</div>
+                            <div className="text-sm text-gray-400">
+                              {new Date(contest.ratingUpdateTimeSeconds * 1000).toLocaleDateString()}
+                            </div>
+                          </div>
+                          <div className={`text-right font-bold ${contest.ratingChange >= 0 ? 'text-green-400' : 'text-red-400'}`}>
+                            {contest.ratingChange >= 0 ? '+' : ''}{contest.ratingChange}
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                )}
+              </motion.div>
+            )}
+
+            {/* Wrong Questions Analysis */}
+            {activeTab === "wrong questions" && (
+              <motion.div
+                initial={{ opacity: 0 }}
+                animate={{ opacity: 1 }}
+                className="space-y-6"
+              >
+                <div className="bg-gray-900 rounded-2xl p-6 border border-gray-800">
+                  <h3 className="text-xl font-bold mb-4 text-red-400">❌ Frequently Wrong Questions</h3>
+                  <div className="space-y-4">
+                    {analytics.commonWrongPatterns.length > 0 ? (
+                      analytics.commonWrongPatterns.map((pattern, idx) => (
+                        <div key={idx} className="bg-gray-800 rounded-lg p-4">
+                          <div className="flex justify-between items-center mb-2">
+                            <span className="font-bold text-red-400">{pattern.tag}</span>
+                            <span className="text-cyan-400">~{pattern.rating} rating</span>
+                          </div>
+                          <p className="text-sm text-gray-300">
+                            You frequently struggle with {pattern.tag} problems around {pattern.rating} rating.
+                            Focus on practicing these specific problem types.
+                          </p>
+                        </div>
+                      ))
+                    ) : (
+                      <p className="text-gray-400 text-center py-8">
+                        No significant wrong patterns detected. Keep practicing!
+                      </p>
+                    )}
+                  </div>
+                </div>
+
+                {/* Recent Wrong Submissions */}
+                <div className="bg-gray-900 rounded-2xl p-6 border border-gray-800">
+                  <h3 className="text-xl font-bold mb-4">Recent Wrong Submissions</h3>
+                  <div className="space-y-3">
+                    {analytics.wrongSubmissions.slice(0, 10).map((submission, idx) => (
+                      <div key={idx} className="flex justify-between items-center p-3 bg-gray-800 rounded-lg">
+                        <div className="flex-1">
+                          <div className="font-medium">{submission.problem.name}</div>
+                          <div className="text-sm text-gray-400">
+                            {submission.problem.tags?.slice(0, 2).join(', ')} • {submission.problem.rating || 'Unknown'} rating
+                          </div>
+                        </div>
+                        <div className="text-red-400 font-bold text-sm">
+                          {submission.verdict}
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              </motion.div>
+            )}
+
+            {/* Submissions */}
+            {activeTab === "submissions" && (
+              <motion.div
+                initial={{ opacity: 0 }}
+                animate={{ opacity: 1 }}
+                className="bg-gray-900 rounded-2xl p-6 border border-gray-800"
+              >
+                <h3 className="text-xl font-bold mb-4">Recent Submissions</h3>
+                <div className="overflow-x-auto">
+                  <table className="w-full">
+                    <thead>
+                      <tr className="border-b border-gray-700">
+                        <th className="text-left p-3">When</th>
+                        <th className="text-left p-3">Problem</th>
+                        <th className="text-left p-3">Rating</th>
+                        <th className="text-left p-3">Verdict</th>
+                        <th className="text-left p-3">Tags</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {allSubmissions.slice(0, 15).map((submission, idx) => (
+                        <tr key={idx} className="border-b border-gray-800 hover:bg-gray-800">
+                          <td className="p-3 text-sm text-gray-400">
+                            {new Date(submission.creationTimeSeconds * 1000).toLocaleDateString()}
+                          </td>
+                          <td className="p-3">
+                            <div className="font-medium">{submission.problem.name}</div>
+                            <div className="text-sm text-gray-400">
+                              {submission.problem.contestId}-{submission.problem.index}
+                            </div>
+                          </td>
+                          <td className="p-3">{submission.problem.rating || '-'}</td>
+                          <td className="p-3">
+                            <span className={
+                              submission.verdict === 'OK'
+                                ? 'text-green-400 font-bold'
+                                : 'text-red-400'
+                            }>
+                              {submission.verdict}
+                            </span>
+                          </td>
+                          <td className="p-3 text-sm text-gray-400">
+                            {submission.problem.tags?.slice(0, 2).join(', ')}
+                          </td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              </motion.div>
+            )}
           </motion.div>
+        )}
+      </AnimatePresence>
 
-          {/* Submissions Table */}
-          <div className="bg-gray-900 p-6 rounded-2xl shadow-lg overflow-auto">
-            <h2 className="text-xl font-bold mb-4">Recent Submissions</h2>
-            <table className="w-full text-left border-collapse">
-              <thead>
-                <tr className="border-b border-gray-700">
-                  <th className="p-2">Problem</th>
-                  <th className="p-2">Rating</th>
-                  <th className="p-2">Verdict</th>
-                  <th className="p-2">Tags</th>
-                  <th className="p-2">Time</th>
-                  <th className="p-2">Memory</th>
-                </tr>
-              </thead>
-              <tbody>
-                {submissions.slice(0, 10).map((s, idx) => (
-                  <tr key={idx} className="border-b border-gray-700 hover:bg-gray-800">
-                    <td className="p-2">{s.problem.name}</td>
-                    <td className="p-2">{s.problem.rating || '-'}</td>
-                    <td className={`p-2 font-medium ${
-                      s.verdict === 'OK' ? 'text-green-400' :
-                      s.verdict === 'WRONG_ANSWER' ? 'text-red-400' :
-                      'text-yellow-400'
-                    }`}>
-                      {s.verdict}
-                    </td>
-                    <td className="p-2 text-xs">
-                      {s.problem.tags.slice(0, 2).join(', ')}
-                    </td>
-                    <td className="p-2">{s.timeConsumedMillis} ms</td>
-                    <td className="p-2">{(s.memoryConsumedBytes/1024).toFixed(2)} KB</td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
+      {/* Footer */}
+      <motion.footer
+        initial={{ opacity: 0 }}
+        animate={{ opacity: 1 }}
+        className="mt-12 pt-6 border-t border-gray-800 text-center text-gray-400"
+      >
+        <div className="flex flex-col md:flex-row justify-between items-center space-y-4 md:space-y-0">
+          <div className="text-sm">
+            Advanced Codeforces Analytics 🚀
+          </div>
+          <div className="flex space-x-6 text-sm">
+            <span>Hidden Insights</span>
+            <span>Performance Tracking</span>
+            <span>Smart Recommendations</span>
+          </div>
+          <div className="text-sm">
+            Made By Aniket Chugh
           </div>
         </div>
-      )}
+      </motion.footer>
     </div>
   );
 }
