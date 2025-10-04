@@ -954,7 +954,7 @@ export default function App() {
             <span>Smart Recommendations</span>
           </div>
           <div className="text-sm">
-            Made By Aniket Chugh
+            Made By <a href="https://www.linkedin.com/in/aniket-chugh/">Aniket Chugh</a>
           </div>
         </div>
       </motion.footer>
