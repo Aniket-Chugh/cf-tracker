@@ -1035,7 +1035,7 @@ export default function App() {
       >
         <div className="flex flex-col md:flex-row justify-between items-center space-y-4 md:space-y-0">
           <div className="text-sm">
-            Advanced Codeforces Analytics 🚀
+            Made By Aniket Chugh 🚀
           </div>
           <div className="flex space-x-6 text-sm">
             <span>Hidden Insights</span>
